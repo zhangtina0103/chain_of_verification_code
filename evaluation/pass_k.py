@@ -1,16 +1,12 @@
 import numpy as np
-import sys
-from io import StringIO
 from typing import List, Dict, Tuple
-import contextlib
 from human_eval.data import read_problems
 from datasets import load_dataset
 import os, json
 from datetime import datetime
 
 """
-Enhanced evaluation script with detailed failure logging for both baseline and refined samples.
-Creates comprehensive log files showing which test cases failed for each problem.
+Pass@k evaluation script for HumanEval and MBPP datasets.
 """
 
 def execute_code_with_details(code: str, test_case: str, timeout: int = 5) -> Tuple[bool, str]:
@@ -64,7 +60,24 @@ def num_successes(code: str, test_cases: List[str]) -> int:
 
     return successes
 
-def evaluate_samples_with_logging(samples: List[str], test_cases: List[str]) -> Tuple[int, int, List[Dict]]:
+def categorize_error(error_msg: str) -> str:
+    """Categorize error type from error message."""
+    if not error_msg:
+        return "success"
+
+    error_lower = error_msg.lower()
+    if "syntaxerror" in error_lower or "syntax error" in error_lower:
+        return "syntax_error"
+    elif "timeouterror" in error_lower or "timed out" in error_lower or "timeout" in error_lower:
+        return "timeout"
+    elif "assertionerror" in error_lower:
+        return "wrong_output"
+    else:
+        # Runtime errors: TypeError, ValueError, NameError, IndexError, etc.
+        return "runtime_error"
+
+
+def evaluate_samples_with_logging(samples: List[str], test_cases: List[str]) -> Tuple[int, int, int, int, List[Dict]]:
     """
     Evaluate multiple code samples against test cases with detailed logging.
 
@@ -73,13 +86,17 @@ def evaluate_samples_with_logging(samples: List[str], test_cases: List[str]) -> 
         test_cases: List of test cases to evaluate against
 
     Returns:
-        Tuple of (n, c, details) where:
+        Tuple of (n, c, compiled, runtime_errors, details) where:
         - n: total number of samples
         - c: number of correct samples (samples that pass all tests)
+        - compiled: number of samples that compiled (no syntax errors)
+        - runtime_errors: number of samples with runtime errors
         - details: List of dicts with detailed results for each sample
     """
     n = len(samples)
     c = 0
+    compiled_count = 0
+    runtime_error_count = 0
     details = []
 
     for idx, sample in enumerate(samples):
@@ -88,18 +105,41 @@ def evaluate_samples_with_logging(samples: List[str], test_cases: List[str]) -> 
             'passed_all': False,
             'num_passed': 0,
             'num_total': len(test_cases),
-            'test_results': []
+            'test_results': [],
+            'compiled': False,
+            'error_type': None
         }
 
+        # Check if sample compiles (no syntax errors)
+        compiled = False
+        try:
+            compile(sample, '<string>', 'exec')
+            compiled = True
+            compiled_count += 1
+        except SyntaxError:
+            compiled = False
+            sample_result['error_type'] = 'syntax_error'
+
+        sample_result['compiled'] = compiled
+
         passed_count = 0
+        has_runtime_error = False
+
         for test_idx, test_case in enumerate(test_cases):
             success, error_msg = execute_code_with_details(sample, test_case)
+
+            error_type = categorize_error(error_msg)
+            if error_type == "runtime_error":
+                has_runtime_error = True
+            elif error_type and not sample_result['error_type']:
+                sample_result['error_type'] = error_type
 
             sample_result['test_results'].append({
                 'test_idx': test_idx,
                 'test_case': test_case,
                 'passed': success,
-                'error': error_msg if not success else None
+                'error': error_msg if not success else None,
+                'error_type': error_type if not success else None
             })
 
             if success:
@@ -108,12 +148,21 @@ def evaluate_samples_with_logging(samples: List[str], test_cases: List[str]) -> 
         sample_result['num_passed'] = passed_count
         sample_result['passed_all'] = (passed_count == len(test_cases))
 
+        if not sample_result['error_type']:
+            sample_result['error_type'] = 'success' if sample_result['passed_all'] else 'wrong_output'
+
+        if has_runtime_error and not sample_result['passed_all']:
+            runtime_error_count += 1
+            if sample_result['error_type'] not in ['syntax_error', 'timeout']:
+                sample_result['error_type'] = 'runtime_error'
+
         if sample_result['passed_all']:
             c += 1
+            sample_result['error_type'] = 'success'
 
         details.append(sample_result)
 
-    return n, c, details
+    return n, c, compiled_count, runtime_error_count, details
 
 def pass_at_k(n: int, c: int, k: int) -> float:
     """
@@ -170,6 +219,8 @@ def evaluate_humaneval_problem_with_logging(problem: Dict, generated_samples: Li
     c = 0
     sample_details = []
 
+    compiled_count = 0
+    runtime_error_count = 0
     for idx, sample in enumerate(full_samples):
         sample_result = {
             'sample_idx': idx,
@@ -177,20 +228,49 @@ def evaluate_humaneval_problem_with_logging(problem: Dict, generated_samples: Li
             'num_passed': 0,
             'num_total': len(test_assertions),
             'test_results': [],
-            'code': generated_samples[idx]
+            'code': generated_samples[idx],
+            'compiled': False,
+            'error_type': None
         }
 
         # First, try to run all tests together
         all_passed = False
+        compiled = False
+        has_runtime_error = False
+
+        namespace = {}
+        # Step 1: Try to compile the sample (only increment compiled_count here)
         try:
-            namespace = {}
             exec(sample, namespace)
-            exec(test_code, namespace)
-            namespace['check'](namespace[problem['entry_point']])
-            all_passed = True
-            c += 1
-        except Exception as overall_error:
-            pass
+            compiled = True
+            compiled_count += 1  # Only increment once, when compilation succeeds
+        except SyntaxError:
+            compiled = False
+            sample_result['error_type'] = 'syntax_error'
+
+        # Step 2: If compilation succeeded, try to run tests
+        if compiled:
+            try:
+                exec(test_code, namespace)
+                namespace['check'](namespace[problem['entry_point']])
+                all_passed = True
+                c += 1
+                sample_result['error_type'] = 'success'
+            except TimeoutError:
+                has_runtime_error = True
+                sample_result['error_type'] = 'timeout'
+            except Exception as test_error:
+                error_type_name = type(test_error).__name__
+                if error_type_name != 'AssertionError':
+                    has_runtime_error = True
+                    runtime_error_count += 1
+                    sample_result['error_type'] = 'runtime_error'
+                else:
+                    sample_result['error_type'] = 'wrong_output'
+
+        sample_result['compiled'] = compiled
+        if has_runtime_error and not all_passed:
+            sample_result['error_type'] = 'runtime_error'
 
         # Now test each assertion individually to see which ones fail
         if test_assertions:
@@ -211,30 +291,61 @@ def evaluate_humaneval_problem_with_logging(problem: Dict, generated_samples: Li
                     test_result['passed'] = True
                     sample_result['num_passed'] += 1
                 except Exception as e:
-                    test_result['error'] = f"{type(e).__name__}: {str(e)}"
+                    error_type_name = type(e).__name__
+                    test_result['error'] = f"{error_type_name}: {str(e)}"
+                    error_type = categorize_error(test_result['error'])
+                    test_result['error_type'] = error_type
+                    if error_type == 'runtime_error' and not sample_result.get('error_type'):
+                        has_runtime_error = True
+                        if sample_result['error_type'] not in ['syntax_error', 'timeout']:
+                            sample_result['error_type'] = 'runtime_error'
 
                 sample_result['test_results'].append(test_result)
 
             sample_result['passed_all'] = all_passed
+            if not sample_result.get('error_type'):
+                sample_result['error_type'] = 'success' if all_passed else 'wrong_output'
         else:
             # If we couldn't extract individual assertions, just use overall result
             sample_result['passed_all'] = all_passed
             if not all_passed:
+                # Get error message from sample_result error_type
+                error_msg = sample_result.get('error_type', 'Unknown error')
                 sample_result['test_results'].append({
                     'test_idx': 0,
                     'test_case': 'check() function',
                     'passed': False,
-                    'error': str(overall_error) if 'overall_error' in locals() else 'Unknown error'
+                    'error': error_msg,
+                    'error_type': categorize_error(error_msg)
                 })
+                if not sample_result.get('error_type'):
+                    sample_result['error_type'] = categorize_error(error_msg)
+
+        if sample_result['passed_all']:
+            sample_result['error_type'] = 'success'
 
         sample_details.append(sample_result)
 
     n = len(generated_samples)
 
+    # Calculate pass@5: if any of the first 5 samples passes, problem passes
+    # Count how many of the first min(5, n) samples passed
+    first_k_samples = min(5, n)
+    c_at_5 = sum(1 for detail in sample_details[:first_k_samples] if detail['passed_all'])
+    pass_at_5 = 1.0 if c_at_5 > 0 else 0.0  # Problem passes if ANY of first 5 samples passes
+
+    compile_rate = compiled_count / n if n > 0 else 0.0
+    # Safety check: compile_rate should never exceed 1.0
+    compile_rate = min(compile_rate, 1.0)
+
     return {
         'n': n,
         'c': c,
+        'compiled': compiled_count,
+        'runtime_errors': runtime_error_count,
+        'compile_rate': compile_rate,
         'pass@1': pass_at_k(n, c, 1) if n >= 1 else 0,
+        'pass@5': pass_at_5,
         'pass@10': pass_at_k(n, c, 10) if n >= 10 else 0,
         'sample_details': sample_details
     }
@@ -255,12 +366,25 @@ def evaluate_mbpp_problem_with_logging(problem: Dict, generated_samples: List[st
         Dictionary with evaluation results and detailed logs
     """
     test_cases = problem['test_list']
-    n, c, details = evaluate_samples_with_logging(generated_samples, test_cases)
+    n, c, compiled, runtime_errors, details = evaluate_samples_with_logging(generated_samples, test_cases)
+
+    # Calculate pass@5: if any of the first 5 samples passes, problem passes
+    first_k_samples = min(5, n)
+    c_at_5 = sum(1 for detail in details[:first_k_samples] if detail['passed_all'])
+    pass_at_5 = 1.0 if c_at_5 > 0 else 0.0  # Problem passes if ANY of first 5 samples passes
+
+    compile_rate = compiled / n if n > 0 else 0.0
+    # Safety check: compile_rate should never exceed 1.0
+    compile_rate = min(compile_rate, 1.0)
 
     return {
         'n': n,
         'c': c,
+        'compiled': compiled,
+        'runtime_errors': runtime_errors,
+        'compile_rate': compile_rate,
         'pass@1': pass_at_k(n, c, 1) if n >= 1 else 0,
+        'pass@5': pass_at_5,
         'pass@10': pass_at_k(n, c, 10) if n >= 10 else 0,
         'sample_details': details
     }
@@ -288,18 +412,44 @@ def write_log_file(log_path: str, results: List[Dict], dataset_name: str, sample
 
         total_problems = len(results)
         total_samples = sum(r['n'] for r in results)
-        total_correct = sum(r['c'] for r in results)
+        total_correct_samples = sum(r['c'] for r in results)
+        total_compiled = sum(r.get('compiled', 0) for r in results)
+        total_runtime_errors = sum(r.get('runtime_errors', 0) for r in results)
+
+        # Count problems where pass@5 = 1.0 (any of 5 samples passed)
+        total_correct_problems = sum(1 for r in results if r.get('pass@5', 0) == 1.0)
+
         avg_pass1 = np.mean([r['pass@1'] for r in results])
+        avg_pass5 = np.mean([r['pass@5'] for r in results]) if all('pass@5' in r for r in results) else None
+
+        # Calculate compile_rate: use average of per-problem compile rates (already 0-1)
+        # This is safer than summing counts which could lead to > 1.0
+        compile_rates = [r.get('compile_rate', 0.0) for r in results if 'compile_rate' in r]
+        if compile_rates:
+            compile_rate = np.mean(compile_rates)
+        else:
+            # Fallback: calculate from totals (but ensure it's <= 1.0)
+            compile_rate = total_compiled / total_samples if total_samples > 0 else 0.0
+
+        # Safety check: compile_rate should never exceed 1.0 (it's a rate, not a count)
+        if compile_rate > 1.0:
+            print(f"WARNING: compile_rate was {compile_rate:.3f}, capping at 1.0")
+            compile_rate = 1.0
 
         f.write(f"SUMMARY:\n")
         f.write(f"  Total problems evaluated: {total_problems}\n")
         f.write(f"  Total samples: {total_samples}\n")
-        f.write(f"  Correct samples: {total_correct}\n")
-        f.write(f"  Average pass@1: {avg_pass1:.4f}\n")
+        f.write(f"  Correct problems (pass@5): {total_correct_problems}/{total_problems}\n")
+        f.write(f"  Correct samples: {total_correct_samples}/{total_samples}\n")
+        f.write(f"  runtime_error: {total_runtime_errors}\n")
+        f.write(f"  compile_rate: {compile_rate:.3f}\n")
+        f.write(f"  pass@1: {avg_pass1:.2f}\n")
+        if avg_pass5 is not None:
+            f.write(f"  pass@5: {avg_pass5:.2f}\n")
 
         if all(r['n'] >= 10 for r in results):
             avg_pass10 = np.mean([r['pass@10'] for r in results])
-            f.write(f"  Average pass@10: {avg_pass10:.4f}\n")
+            f.write(f"  pass@10: {avg_pass10:.2f}\n")
 
         f.write(f"\n{'='*80}\n\n")
 
@@ -308,7 +458,8 @@ def write_log_file(log_path: str, results: List[Dict], dataset_name: str, sample
             task_id = result['task_id']
             f.write(f"\nPROBLEM: {task_id}\n")
             f.write(f"{'-'*80}\n")
-            f.write(f"Samples: {result['n']}, Correct: {result['c']}, pass@1: {result['pass@1']:.4f}\n\n")
+            pass5_status = "✓ PASSED" if result.get('pass@5', 0) == 1.0 else "✗ FAILED"
+            f.write(f"Samples: {result['n']}, Correct samples: {result['c']}, pass@1: {result['pass@1']:.4f}, pass@5: {result.get('pass@5', 0):.4f} ({pass5_status})\n\n")
 
             if 'sample_details' in result:
                 for detail in result['sample_details']:
@@ -401,15 +552,23 @@ def evaluate_all_humaneval_with_logging(output_dir, sample_field='refined_sample
     write_log_file(log_path, results, "HumanEval", sample_field)
 
     pass1 = np.mean([r["pass@1"] for r in results])
+    pass5 = np.mean([r["pass@5"] for r in results]) if all('pass@5' in r for r in results) else None
     pass10 = np.mean([r["pass@10"] for r in results]) if all(r['n'] >= 10 for r in results) else None
+
+    total_compiled = sum(r.get('compiled', 0) for r in results)
+    total_samples = sum(r['n'] for r in results)
+    compile_rate = total_compiled / total_samples if total_samples > 0 else 0.0
 
     print(f"\n{'='*50}")
     print(f"HUMANEVAL - {sample_field}")
     print(f"{'='*50}")
     print(f"Evaluated {len(results)} problems")
-    print(f"pass@1:  {pass1:.4f}")
+    print(f"compile_rate: {compile_rate:.3f}")
+    print(f"pass@1: {pass1:.2f}")
+    if pass5 is not None:
+        print(f"pass@5: {pass5:.2f}")
     if pass10 is not None:
-        print(f"pass@10: {pass10:.4f}")
+        print(f"pass@10: {pass10:.2f}")
     print(f"Log file written to: {log_path}")
 
     return results
@@ -468,15 +627,23 @@ def evaluate_all_mbpp_with_logging(output_dir, sample_field='refined_samples', l
     write_log_file(log_path, results, "MBPP", sample_field)
 
     pass1 = np.mean([r["pass@1"] for r in results])
+    pass5 = np.mean([r["pass@5"] for r in results]) if all('pass@5' in r for r in results) else None
     pass10 = np.mean([r["pass@10"] for r in results]) if all(r['n'] >= 10 for r in results) else None
+
+    total_compiled = sum(r.get('compiled', 0) for r in results)
+    total_samples = sum(r['n'] for r in results)
+    compile_rate = total_compiled / total_samples if total_samples > 0 else 0.0
 
     print(f"\n{'='*50}")
     print(f"MBPP - {sample_field}")
     print(f"{'='*50}")
     print(f"Evaluated {len(results)} problems")
-    print(f"pass@1:  {pass1:.4f}")
+    print(f"compile_rate: {compile_rate:.3f}")
+    print(f"pass@1: {pass1:.2f}")
+    if pass5 is not None:
+        print(f"pass@5: {pass5:.2f}")
     if pass10 is not None:
-        print(f"pass@10: {pass10:.4f}")
+        print(f"pass@10: {pass10:.2f}")
     print(f"Log file written to: {log_path}")
 
     return results
@@ -508,12 +675,49 @@ def compare_baseline_vs_refined_with_logging(output_dir, dataset='humaneval', lo
     if baseline_results and refined_results:
         baseline_pass1 = np.mean([r["pass@1"] for r in baseline_results])
         refined_pass1 = np.mean([r["pass@1"] for r in refined_results])
+        baseline_pass5 = np.mean([r["pass@5"] for r in baseline_results]) if all('pass@5' in r for r in baseline_results) else None
+        refined_pass5 = np.mean([r["pass@5"] for r in refined_results]) if all('pass@5' in r for r in refined_results) else None
+
+        # Calculate compile rates
+        baseline_total_compiled = sum(r.get('compiled', 0) for r in baseline_results)
+        refined_total_compiled = sum(r.get('compiled', 0) for r in refined_results)
+        baseline_total_samples = sum(r['n'] for r in baseline_results)
+        refined_total_samples = sum(r['n'] for r in refined_results)
+        baseline_compile_rate = baseline_total_compiled / baseline_total_samples if baseline_total_samples > 0 else 0.0
+        refined_compile_rate = refined_total_compiled / refined_total_samples if refined_total_samples > 0 else 0.0
+        # Safety check: cap at 1.0
+        baseline_compile_rate = min(baseline_compile_rate, 1.0)
+        refined_compile_rate = min(refined_compile_rate, 1.0)
+
+        # Calculate runtime errors
+        baseline_runtime_errors = sum(r.get('runtime_errors', 0) for r in baseline_results)
+        refined_runtime_errors = sum(r.get('runtime_errors', 0) for r in refined_results)
+
         improvement = refined_pass1 - baseline_pass1
+        improvement5 = (refined_pass5 - baseline_pass5) if (baseline_pass5 is not None and refined_pass5 is not None) else None
 
         print(f"\nSummary:")
-        print(f"Baseline pass@1:  {baseline_pass1:.4f}")
-        print(f"Refined pass@1:   {refined_pass1:.4f}")
-        print(f"Improvement:      {improvement:+.4f} ({improvement/baseline_pass1*100:+.2f}%)")
+        print(f"Baseline compile_rate: {baseline_compile_rate:.3f}")
+        print(f"Refined compile_rate: {refined_compile_rate:.3f}")
+        print(f"Baseline runtime_errors: {baseline_runtime_errors}")
+        print(f"Refined runtime_errors: {refined_runtime_errors}")
+        print(f"Baseline pass@1: {baseline_pass1:.2f}")
+        print(f"Refined pass@1: {refined_pass1:.2f}")
+        print(f"Improvement: {improvement:+.2f} ({improvement/baseline_pass1*100:+.2f}%)")
+
+        baseline_pass10 = np.mean([r["pass@10"] for r in baseline_results]) if all(r['n'] >= 10 for r in baseline_results) else None
+        refined_pass10 = np.mean([r["pass@10"] for r in refined_results]) if all(r['n'] >= 10 for r in refined_results) else None
+        if baseline_pass10 is not None and refined_pass10 is not None:
+            improvement10 = refined_pass10 - baseline_pass10
+            print(f"Baseline pass@10: {baseline_pass10:.2f}")
+            print(f"Refined pass@10: {refined_pass10:.2f}")
+            print(f"Improvement: {improvement10:+.2f} ({improvement10/baseline_pass10*100:+.2f}%)")
+
+        if baseline_pass5 is not None and refined_pass5 is not None:
+            print(f"\nBaseline pass@5: {baseline_pass5:.2f}")
+            print(f"Refined pass@5: {refined_pass5:.2f}")
+            if improvement5 is not None:
+                print(f"Improvement: {improvement5:+.2f} ({improvement5/baseline_pass5*100:+.2f}%)")
 
         # Write comparison summary
         comparison_path = os.path.join(log_dir, f"{dataset}_comparison_summary.txt")
@@ -522,17 +726,44 @@ def compare_baseline_vs_refined_with_logging(output_dir, dataset='humaneval', lo
             f.write(f"COMPARISON: Baseline vs Refined ({dataset.upper()})\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"{'='*60}\n\n")
-            f.write(f"Baseline pass@1:  {baseline_pass1:.4f}\n")
-            f.write(f"Refined pass@1:   {refined_pass1:.4f}\n")
-            f.write(f"Improvement:      {improvement:+.4f} ({improvement/baseline_pass1*100:+.2f}%)\n\n")
+            # Calculate compile rates for comparison
+            baseline_total_compiled = sum(r.get('compiled', 0) for r in baseline_results)
+            refined_total_compiled = sum(r.get('compiled', 0) for r in refined_results)
+            baseline_total_samples = sum(r['n'] for r in baseline_results)
+            refined_total_samples = sum(r['n'] for r in refined_results)
+            baseline_compile_rate = baseline_total_compiled / baseline_total_samples if baseline_total_samples > 0 else 0.0
+            refined_compile_rate = refined_total_compiled / refined_total_samples if refined_total_samples > 0 else 0.0
+            # Safety check: cap at 1.0
+            baseline_compile_rate = min(baseline_compile_rate, 1.0)
+            refined_compile_rate = min(refined_compile_rate, 1.0)
+
+            # Calculate runtime errors
+            baseline_runtime_errors = sum(r.get('runtime_errors', 0) for r in baseline_results)
+            refined_runtime_errors = sum(r.get('runtime_errors', 0) for r in refined_results)
+
+            f.write(f"Baseline compile_rate: {baseline_compile_rate:.3f}\n")
+            f.write(f"Refined compile_rate: {refined_compile_rate:.3f}\n")
+            f.write(f"Baseline runtime_errors: {baseline_runtime_errors}\n")
+            f.write(f"Refined runtime_errors: {refined_runtime_errors}\n")
+            f.write(f"Baseline pass@1: {baseline_pass1:.2f}\n")
+            f.write(f"Refined pass@1: {refined_pass1:.2f}\n")
+            f.write(f"Improvement: {improvement:+.2f} ({improvement/baseline_pass1*100:+.2f}%)\n\n")
 
             if all(r['n'] >= 10 for r in baseline_results) and all(r['n'] >= 10 for r in refined_results):
                 baseline_pass10 = np.mean([r["pass@10"] for r in baseline_results])
                 refined_pass10 = np.mean([r["pass@10"] for r in refined_results])
                 improvement_pass10 = refined_pass10 - baseline_pass10
-                f.write(f"Baseline pass@10:  {baseline_pass10:.4f}\n")
-                f.write(f"Refined pass@10:   {refined_pass10:.4f}\n")
-                f.write(f"Improvement:       {improvement_pass10:+.4f} ({improvement_pass10/baseline_pass10*100:+.2f}%)\n")
+                f.write(f"Baseline pass@10: {baseline_pass10:.2f}\n")
+                f.write(f"Refined pass@10: {refined_pass10:.2f}\n")
+                f.write(f"Improvement: {improvement_pass10:+.2f} ({improvement_pass10/baseline_pass10*100:+.2f}%)\n\n")
+
+            baseline_pass5 = np.mean([r["pass@5"] for r in baseline_results]) if all('pass@5' in r for r in baseline_results) else None
+            refined_pass5 = np.mean([r["pass@5"] for r in refined_results]) if all('pass@5' in r for r in refined_results) else None
+            if baseline_pass5 is not None and refined_pass5 is not None:
+                improvement5 = refined_pass5 - baseline_pass5
+                f.write(f"Baseline pass@5: {baseline_pass5:.2f}\n")
+                f.write(f"Refined pass@5: {refined_pass5:.2f}\n")
+                f.write(f"Improvement: {improvement5:+.2f} ({improvement5/baseline_pass5*100:+.2f}%)\n")
 
         print(f"Comparison summary written to: {comparison_path}")
 
