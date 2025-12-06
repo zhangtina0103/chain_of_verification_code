@@ -1,131 +1,288 @@
-######################################################################## BASELINE PROMPTS ########################################################################
-BASELINE_PROMPT_WIKI = """Answer the below question which is asking for a list of entities (names, places, locations etc). Output should be a numbered list and only contains the relevant & concise enitites as answer. NO ADDITIONAL DETAILS.
+########################################################################
+# BASELINE CODE GENERATION PROMPTS
+########################################################################
 
-Question: {original_question}
+# 4 different categories for baseline
+BASELINE_BY_CATEGORY = {
+    "algorithms": """Write a single Python function that solves this algorithmic task.
 
-Answer:"""
+Requirements:
+- Use no external libraries beyond standard library (collections, heapq, itertools, etc. are OK)
+- Output ONLY valid Python code with no markdown formatting
+- No explanation or comments
+- Must be a complete, runnable function
 
-BASELINE_PROMPT_MULTI = """Answer the below question correctly and in a concise manner without much details. Only answer what the question is asked.
+Task:
+{question}
 
-Question: {original_question}
+Python code:""",
 
-Answer:"""
+    "debugging": """You are fixing broken Python code.
 
-BASELINE_PROMPT_LONG = """Answer the below question correctly.
+The user has described a bug or provided failing code.
 
-Question: {original_question}
+Task:
+- Correct the code to fix all bugs
+- Preserve the same function signature and interface
+- Output ONLY working code with no markdown formatting
+- No explanation
 
-Answer:"""
+User query:
+{question}
 
-################################################################### PLAN VERIFICATION PROMPTS ###################################################################
-VERIFICATION_QUESTION_TEMPLATE_PROMPT_WIKI = """Your task is to create a verification question based on the below question provided.
-Example Question: Who are some movie actors who were born in Boston?
-Example Verification Question: Was [movie actor] born in [Boston]
-Explanation: In the above example the verification question focused only on the ANSWER_ENTITY (name of the movie actor) and QUESTION_ENTITY (birth place).
-Similarly you need to focus on the ANSWER_ENTITY and QUESTION_ENTITY from the actual question and generate verification question.
+Fixed Python code:""",
 
-Actual Question: {original_question}
+    "api_usage": """Write a single Python function that demonstrates correct usage of this API or library.
 
-Final Verification Question:"""
+Rules:
+- Include necessary imports at the top
+- Create one complete function (not a class or app)
+- Do NOT include example usage or main() calls
+- Must be runnable without modification
+- Output ONLY Python code with no markdown formatting
+- No explanation
 
-VERIFICATION_QUESTION_PROMPT_WIKI = """Your task is to create a series of verification questions based on the below question, the verfication question template and baseline response.
-Example Question: Who are some movie actors who were born in Boston?
-Example Verification Question Template: Was [movie actor] born in Boston?
-Example Baseline Response: 1. Matt Damon - Famous for his roles in films like "Good Will Hunting," "The Bourne Identity" series, and "The Martian," Damon is an Academy Award-winning actor, screenwriter, and producer.
-2. Chris Evans - Famous for his portrayal of Captain America in the Marvel Cinematic Universe, Evans has also appeared in movies like "Snowpiercer" and "Knives Out."
-Verification questions: 1. Was Matt Damon born in Boston?
-2. Was Chirs Evans born in Boston?
-etc.
-Example Verification Question: 1. Was Matt Damon born in Boston?
-2. Was Chris Evans born in Boston?
+Task:
+{question}
 
-Explanation: In the above example the verification questions focused only on the ANSWER_ENTITY (name of the movie actor) and QUESTION_ENTITY (birth place) based on the template and substitutes entity values from the baseline response.
-Similarly you need to focus on the ANSWER_ENTITY and QUESTION_ENTITY from the actual question and substitute the entity values from the baseline response to generate verification questions.
+Python code:""",
 
-Actual Question: {original_question}
-Baseline Response: {baseline_response}
-Verification Question Template: {verification_question_template}
+    "data_processing": """Write a single Python function that loads, transforms, and returns structured data.
 
-Final Verification Questions:"""
+Requirements:
+- Use ONLY standard Python libraries (json, csv, re, etc.)
+- Must be a single function that takes input and returns output
+- Output ONLY code with no markdown formatting
+- No explanation
 
-VERIFICATION_QUESTION_PROMPT_MULTI = """Your task is to create verification questions based on the below original question and the baseline response. The verification questions are meant for verifying the factual acuracy in the baseline response.
-Example Question: Who invented the first printing press and in what year?
-Example Baseline Response: Johannes Gutenberg, 1450.
-Example Verification Questions: 1. Did Johannes Gutenberg invent first printing press?
-2. Did Johannes Gutenberg invent first printing press in the year 1450?
+Task:
+{question}
 
-Explanation: The verification questions are highly aligned with both the qctual question and baseline response. The actual question is comprises of multiple independent questions which in turn has multiple independent answers in the baseline response. Hence, the verification questions should also be independent for factual verification.
+Python code:"""
+}
 
-Actual Question: {original_question}
-Baseline Response: {baseline_response}
+########################################################################
+# VERIFICATION TEST GENERATION PROMPTS
+########################################################################
 
-Final Verification Questions:"""
+VERIFY_PLAN_BY_CATEGORY = {
+    "algorithms": """Generate 5-8 test cases for this function.
 
-VERIFICATION_QUESTION_PROMPT_LONG = """Your task is to create verification questions based on the below original question and the baseline response. The verification questions are meant for verifying the factual acuracy in the baseline response. Output should be numbered list of verification questions.
+Return a Python list of tuples where each tuple is (input_args, expected_output).
 
-Actual Question: {original_question}
-Baseline Response: {baseline_response}
+Rules:
+- Output ONLY a Python list literal (no variables, no code, just the list)
+- Include edge cases (empty input, single element, large input, etc.)
+- Use only Python literals (no function calls)
+- Format: [(input1, expected1), (input2, expected2), ...]
+- For functions with multiple args, use tuple: (((arg1, arg2), expected_output))
 
-Final Verification Questions:"""
+Task:
+{question}
 
-################################################################## EXECUTE VERIFICATION PROMPTS ##################################################################
-EXECUTE_PLAN_PROMPT_SEARCH_TOOL = """Answer the following question correctly based on the provided context. The question could be tricky as well, so think step by step and answer it correctly.
+Candidate function:
+```python
+{baseline_code}
+```
 
-Context: {search_result}
+Test cases as Python list:""",
 
-Question: {verification_question}
+    "debugging": """Generate 3-5 test inputs that are LIKELY to trigger bugs or edge case failures.
 
-Answer:"""
+Return ONLY a Python list of input values.
+
+We don't know the expected outputs - we're testing if the code runs without errors.
+
+Rules:
+- Output ONLY a Python list literal
+- Focus on edge cases that might break the code
+- Format: [input1, input2, input3, ...]
+
+Task:
+{question}
+
+Candidate code:
+```python
+{baseline_code}
+```
+
+Test inputs as Python list:""",
+
+    "api_usage": """Generate minimal Python code that calls this function and prints the result.
+
+This code will test if the API usage is correct.
+
+Rules:
+- Output ONLY Python code
+- Import any mock data needed
+- Call the function with realistic arguments
+- Print or return the result
+- Keep it minimal (2-5 lines)
+
+Candidate function:
+```python
+{baseline_code}
+```
+
+Test harness code:""",
+
+    "data_processing": """Generate sample input data and expected output for this data processing function.
+
+Return ONLY valid Python code that defines two variables:
+- TEST_INPUT = <sample input data>
+- EXPECTED_OUTPUT = <expected result>
+
+Rules:
+- Use Python literals only (strings, lists, dicts)
+- Make the test realistic but small
+- Output ONLY the two variable assignments
+
+Task:
+{question}
+
+Candidate function:
+```python
+{baseline_code}
+```
+
+Test data:"""
+}
 
 
-EXECUTE_PLAN_PROMPT_SELF_LLM = """Answer the following question correctly.
+########################################################################
+# REFINEMENT PROMPTS
+########################################################################
 
-Question: {verification_question}
+FINAL_REWRITE_BY_CATEGORY = {
+    "algorithms": """The function failed one or more test cases.
 
-Answer:"""
+Original task:
+{question}
 
-EXECUTE_PLAN_PROMPT = "{verification_questions}"
+Your previous code:
+```python
+{baseline_code}
+```
 
-################################################################## FINAL REFINED PROMPTS ##################################################################
-FINAL_REFINED_PROMPT = """Given the below `Original Query` and `Baseline Answer`, analyze the `Verification Questions & Answers` to finally filter the refined answer.
-Original Query: {original_question}
-Baseline Answer: {baseline_response}
+Test failures:
+{failures}
 
-Verification Questions & Answer Pairs:
-{verification_answers}
+Rewrite the function to pass all test cases.
 
-Final Refined Answer:"""
+Requirements:
+- Output ONLY the corrected Python code
+- No markdown formatting
+- No explanation
 
-################################################################## ROUTER PROMPTS ##################################################################
-ROUTER_CHAIN_PROMPT = """Please classify the below question in on of the following categories. The output should be a JSON as shown in the Examples.
+Corrected code:""",
+
+    "debugging": """The function raised errors when executed on test inputs.
+
+Original task:
+{question}
+
+Your previous code:
+```python
+{baseline_code}
+```
+
+Execution errors:
+{stderr}
+
+Failed on inputs: {failed_inputs}
+
+Rewrite the code to eliminate ALL errors.
+
+Requirements:
+- Output ONLY the corrected Python code
+- No markdown formatting
+- No explanation
+
+Corrected code:""",
+
+    "api_usage": """The generated function failed when executed.
+
+Task:
+{question}
+
+Your previous code:
+```python
+{baseline_code}
+```
+
+Error message:
+{stderr}
+
+Rewrite the function to correctly use the API.
+
+Requirements:
+- Output ONLY the corrected Python code
+- No markdown formatting
+- No explanation
+
+Corrected code:""",
+
+    "data_processing": """The function output did not match expected result.
+
+Task:
+{question}
+
+Your previous code:
+```python
+{baseline_code}
+```
+
+Expected output:
+{expected}
+
+Actual output:
+{actual}
+
+Rewrite the function to produce the correct result.
+
+Requirements:
+- Output ONLY the corrected Python code
+- No markdown formatting
+- No explanation
+
+Corrected code:"""
+}
+
+
+########################################################################
+# ROUTER PROMPT
+########################################################################
+
+ROUTER_CHAIN_PROMPT = """Classify this coding question into exactly ONE category.
 
 Categories:
-WIKI_CHAIN: Good for answering questions which asks for a list or set of entites as its answer. 
-MULTI_CHAIN: Good for answering questions which  comprises of questions that have multiple independent answers (derived from a series of multiple discontiguous spans in the text) and multiple questions are asked in the original question.
-LONG_CHAIN: Good for answering questions whose answer is long.
+- algorithms: Writing pure functions on data structures (sorting, searching, graph traversal, dynamic programming, etc.)
+- debugging: Fixing broken code, handling errors, or correcting failing implementations
+- api_usage: Using external libraries or frameworks (requests, FastAPI, pandas, numpy, OpenAI API, etc.)
+- data_processing: Reading, transforming, or writing structured data (CSV, JSON, XML, logs, etc.)
 
 Examples:
-WIKI_CHAIN:
-    Question: Name some Endemic orchids of Vietnam.
-    JSON Output: {{"category": "WIKI_CHAIN"}}
-    Question: Who are the scientist won nobel prize in the year 1970?
-    JSON Output: {{"category": "WIKI_CHAIN"}}
-    Question: List some cricket players who are playing in indian cricket team.
-    JSON Output: {{"category": "WIKI_CHAIN"}}
-MULTI_CHAIN:
-    Question: Who is known for developing the theory of relativity, and in which year was it introduced?
-    JSON Output: {{"category": "MULTI_CHAIN"}}
-    Question: Who is credited with inventing the telephone, and when did this invention take place?
-    JSON Output: {{"category": "MULTI_CHAIN"}}
-    Question: Who was the first person to orbit the Earth in space, and during which year did this historic event occur?
-    JSON Output: {{"category": "MULTI_CHAIN"}}
-LONG_CHAIN:
-    Question: Write few lines about Einstein.
-    JSON Output: {{"category": "LONG_CHAIN"}}
-    Question: Tell me in short about first moon landing.
-    JSON Output: {{"category": "LONG_CHAIN"}}
-    Question: Write a short biography of Carl Marx.
-    JSON Output: {{"category": "LONG_CHAIN"}}
-    
-Actual Question: {}
-Final JSON Output:"""
+
+algorithms:
+- "Implement breadth-first search"
+- "Write a function to find the longest palindrome substring"
+- "Sort an array using merge sort"
+
+debugging:
+- "Fix this Python function that crashes on empty lists"
+- "Why does my recursive function cause stack overflow?"
+- "Debug this code that returns wrong results"
+
+api_usage:
+- "Write a FastAPI POST endpoint"
+- "Use requests to fetch data from an API"
+- "Create a pandas DataFrame from a dictionary"
+
+data_processing:
+- "Parse CSV and return dict sorted by key"
+- "Convert JSON to nested dictionary"
+- "Extract email addresses from log file"
+
+Question: {question}
+
+Output ONLY one word (the category name):"""
